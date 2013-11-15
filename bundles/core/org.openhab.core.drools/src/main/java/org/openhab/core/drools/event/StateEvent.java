@@ -13,37 +13,50 @@ import org.openhab.core.types.State;
 
 /**
  * This class is used as a fact in rules to inform about received status updates on the openHAB event bus.
- * 
+ *
  * @author Kai Kreuzer
  * @since 0.7.0
  *
  */
-public class StateEvent extends RuleEvent {
+public class StateEvent implements ImmediateEvent {
 
-	protected boolean changed;
-	protected State oldState;
-	protected State newState;
+    private Item item;
+    private State oldState;
+    private State state;
+    private boolean changed;
 
-	public StateEvent(Item item, State oldState, State newState) {
-		super(item);
-		this.oldState = oldState;
-		this.newState = newState;
-		this.changed = !oldState.equals(newState);
+    protected StateEvent(Item item, State oldState, State state, boolean changed) {
+        this.item = item;
+        this.oldState = oldState;
+		this.state = state;
+		this.changed = changed;
 	}
 
-	public StateEvent(Item item, State state) {
-		this(item, state, state);
-	}
-	
-	public boolean isChanged() {
-		return changed;
-	}
+    public static StateEvent create(Item item, State oldState, State newState) {
+        if (oldState.equals(newState)) {
+            return create(item, newState);
+        } else {
+            return new StateChange(item, oldState, newState);
+        }
+    }
 
-	public State getOldState() {
+    public static StateEvent create(Item item, State state) {
+        return new StateEvent(item, state, state, false);
+    }
+
+    public Item getItem() {
+        return item;
+    }
+
+    public State getOldState() {
 		return oldState;
 	}
 
-	public State getNewState() {
-		return newState;
-	}	
+	public State getState() {
+		return state;
+	}
+
+    public boolean isChanged() {
+        return changed;
+    }
 }

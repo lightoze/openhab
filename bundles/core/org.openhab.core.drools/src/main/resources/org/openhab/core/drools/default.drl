@@ -1,0 +1,4 @@
+package org.openhab.core.drools
+dialect "mvel"
+
+import org.openhab.core.drools.event.*

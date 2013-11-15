@@ -18,14 +18,19 @@ import org.openhab.core.types.Command;
  * @since 0.7.0
  *
  */
-public class CommandEvent extends RuleEvent {
+public class CommandEvent implements ImmediateEvent {
 
-	protected Command command;
+    private Item item;
+    private Command command;
 
-	public CommandEvent(Item item, Command command) {
-		super(item);
-		this.command = command;
+    public CommandEvent(Item item, Command command) {
+        this.item = item;
+        this.command = command;
 	}
+
+    public Item getItem() {
+        return item;
+    }
 
 	public Command getCommand() {
 		return command;

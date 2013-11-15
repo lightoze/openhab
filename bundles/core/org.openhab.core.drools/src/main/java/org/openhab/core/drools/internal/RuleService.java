@@ -8,341 +8,428 @@
  */
 package org.openhab.core.drools.internal;
 
-import static org.openhab.core.events.EventConstants.TOPIC_PREFIX;
-import static org.openhab.core.events.EventConstants.TOPIC_SEPERATOR;
-
-import java.util.ArrayList;
-import java.util.Collection;
-import java.util.Collections;
-import java.util.Dictionary;
-import java.util.HashMap;
-import java.util.List;
-import java.util.Map;
-
-import org.apache.commons.lang.StringUtils;
-import org.drools.KnowledgeBase;
-import org.drools.KnowledgeBaseFactory;
-import org.drools.ObjectFilter;
-import org.drools.SystemEventListener;
-import org.drools.SystemEventListenerFactory;
-import org.drools.agent.KnowledgeAgent;
-import org.drools.agent.KnowledgeAgentConfiguration;
-import org.drools.agent.KnowledgeAgentFactory;
-import org.drools.builder.KnowledgeBuilder;
-import org.drools.builder.KnowledgeBuilderFactory;
-import org.drools.builder.ResourceType;
-import org.drools.io.ResourceChangeScannerConfiguration;
-import org.drools.io.ResourceFactory;
-import org.drools.runtime.StatefulKnowledgeSession;
-import org.drools.runtime.rule.FactHandle;
-import org.openhab.core.drools.event.CommandEvent;
-import org.openhab.core.drools.event.RuleEvent;
-import org.openhab.core.drools.event.StateEvent;
-import org.openhab.core.items.GenericItem;
-import org.openhab.core.items.Item;
-import org.openhab.core.items.ItemNotFoundException;
-import org.openhab.core.items.ItemRegistry;
-import org.openhab.core.items.ItemRegistryChangeListener;
-import org.openhab.core.items.StateChangeListener;
-import org.openhab.core.service.AbstractActiveService;
+import com.google.common.base.Throwables;
+import com.google.common.collect.LinkedListMultimap;
+import org.apache.commons.io.FileUtils;
+import org.apache.commons.io.filefilter.FileFilterUtils;
+import org.apache.commons.io.filefilter.HiddenFileFilter;
+import org.apache.commons.io.filefilter.IOFileFilter;
+import org.apache.commons.io.monitor.FileAlterationListenerAdaptor;
+import org.apache.commons.io.monitor.FileAlterationMonitor;
+import org.apache.commons.io.monitor.FileAlterationObserver;
+import org.apache.commons.lang.time.DateFormatUtils;
+import org.drools.core.io.impl.ClassPathResource;
+import org.drools.core.io.impl.FileSystemResource;
+import org.kie.api.KieServices;
+import org.kie.api.builder.KieFileSystem;
+import org.kie.api.builder.Message;
+import org.kie.api.builder.ReleaseId;
+import org.kie.api.builder.Results;
+import org.kie.api.builder.model.KieModuleModel;
+import org.kie.api.builder.model.KieSessionModel;
+import org.kie.api.conf.EventProcessingOption;
+import org.kie.api.io.Resource;
+import org.kie.api.runtime.KieContainer;
+import org.kie.api.runtime.KieSession;
+import org.kie.api.runtime.rule.FactHandle;
+import org.openhab.core.drools.event.*;
+import org.openhab.core.items.*;
 import org.openhab.core.types.Command;
 import org.openhab.core.types.EventType;
 import org.openhab.core.types.State;
-import org.osgi.service.cm.ConfigurationException;
-import org.osgi.service.cm.ManagedService;
 import org.osgi.service.event.Event;
 import org.osgi.service.event.EventHandler;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 
-public class RuleService extends AbstractActiveService implements ManagedService, EventHandler, ItemRegistryChangeListener, StateChangeListener {
+import java.io.File;
+import java.util.*;
 
-	private static final String RULES_CHANGESET = "org/openhab/core/drools/changeset.xml";
+import static org.openhab.core.events.EventConstants.TOPIC_PREFIX;
+import static org.openhab.core.events.EventConstants.TOPIC_SEPERATOR;
 
-	static private final Logger logger = LoggerFactory.getLogger(RuleService.class);
-	
-	private ItemRegistry itemRegistry = null;
-	
-	private long refreshInterval = 200;
-		
-	private StatefulKnowledgeSession ksession = null;
-	
-	private Map<String, FactHandle> factHandleMap = new HashMap<String, FactHandle>();
-	
-	private List<RuleEvent> eventQueue = Collections.synchronizedList(new ArrayList<RuleEvent>());
-	
-	public void activate() {
-		
-		SystemEventListenerFactory.setSystemEventListener(new RuleEventListener());
+public class RuleService implements EventHandler, ItemRegistryChangeListener, StateChangeListener {
 
-		KnowledgeBuilder kbuilder = KnowledgeBuilderFactory.newKnowledgeBuilder();
-		kbuilder.add(ResourceFactory.newClassPathResource(RULES_CHANGESET, getClass()), ResourceType.CHANGE_SET);
+    private static final File RULES_DIR = new File("configurations/drools/");
+    private static final IOFileFilter RULES_FILTER = FileFilterUtils.and(
+            FileFilterUtils.fileFileFilter(),
+            HiddenFileFilter.VISIBLE);
+    private static final IOFileFilter RULES_DIR_FILTER = FileFilterUtils.and(
+            FileFilterUtils.directoryFileFilter(),
+            HiddenFileFilter.VISIBLE);
 
-		if(kbuilder.hasErrors()) {
-		    logger.error("There are errors in the rules: " + kbuilder.getErrors());
-		    return;
-		}
+    private static final Logger logger = LoggerFactory.getLogger(RuleService.class);
 
-		KnowledgeBase kbase = KnowledgeBaseFactory.newKnowledgeBase();
+    private ItemRegistry itemRegistry;
 
-		KnowledgeAgentConfiguration aconf = KnowledgeAgentFactory.newKnowledgeAgentConfiguration();
-		aconf.setProperty("drools.agent.newInstance", "false");
-		KnowledgeAgent kagent = KnowledgeAgentFactory.newKnowledgeAgent("RuleAgent", kbase, aconf);		 
-		kagent.applyChangeSet(ResourceFactory.newClassPathResource(RULES_CHANGESET, getClass()));
-		kbase.addKnowledgePackages(kbuilder.getKnowledgePackages());
-		ksession = kbase.newStatefulKnowledgeSession();
-				
-		// activate notifications
-		ResourceFactory.getResourceChangeNotifierService().start();
-		ResourceFactory.getResourceChangeScannerService().start();
-		
-		// activate this for extensive logging
-		// KnowledgeRuntimeLoggerFactory.newConsoleLogger(ksession);
-		
-		// set the scan interval to 20 secs
-		ResourceChangeScannerConfiguration sconf = ResourceFactory.getResourceChangeScannerService().newResourceChangeScannerConfiguration();
-		sconf.setProperty( "drools.resource.scanner.interval", "20" ); 
-		ResourceFactory.getResourceChangeScannerService().configure(sconf);
-		
-		// now add all registered items to the session
-		if(itemRegistry!=null) {
-			for(Item item : itemRegistry.getItems()) {
-				itemAdded(item);
-			}
-		}
-		
-		setProperlyConfigured(true);
-	}
-	
-	public void deactivate() {
-		if(ksession!=null) {
-			ksession.dispose();
-			ksession = null;
-		}
-		factHandleMap.clear();
-		shutdown();
-	}
-	
-	public void setItemRegistry(ItemRegistry itemRegistry) {
-		this.itemRegistry = itemRegistry;
-		itemRegistry.addItemRegistryChangeListener(this);
-	}
-	
-	public void unsetItemRegistry(ItemRegistry itemRegistry) {
-		itemRegistry.removeItemRegistryChangeListener(this);
-		this.itemRegistry = null;
-	}
-	
-	/**
-	 * {@inheritDoc}
-	 */
-	@SuppressWarnings("rawtypes")
-	public void updated(Dictionary config) throws ConfigurationException {
-		if (config != null) {
-			String evalIntervalString = (String) config.get("evalInterval");
-			if (StringUtils.isNotBlank(evalIntervalString)) {
-				refreshInterval = Long.parseLong(evalIntervalString);
-			}
-		}
-	}
+    private Map<String, FactHandle> factHandles = new HashMap<String, FactHandle>();
 
-	/**
-	 * {@inheritDoc}
-	 */
-	public void allItemsChanged(Collection<String> oldItemNames) {
-		if(ksession!=null) {
-			// first remove all previous items from the session
-			for(String oldItemName : oldItemNames) {
-				internalItemRemoved(oldItemName);
-			}
-			
-			// then add the current ones again
-			Collection<Item> items = itemRegistry.getItems();
-			for(Item item : items) {
-				internalItemAdded(item);
-			}
-		}
-	}
+    private final LinkedListMultimap<String, Object> updates = LinkedListMultimap.create();
 
-	/**
-	 * {@inheritDoc}
-	 */
-	public void itemAdded(Item item) {
-		if(ksession!=null) {
-			internalItemAdded(item);
-		}
-	}
+    private KieServices ks;
 
-	/**
-	 * {@inheritDoc}
-	 */
-	public void itemRemoved(Item item) {
-		if(ksession!=null) {
-			internalItemRemoved(item.getName());
-			if (item instanceof GenericItem) {
-				GenericItem genericItem = (GenericItem) item;
-				genericItem.removeStateChangeListener(this);
-			}
-		}
-	}
+    private KieFileSystem kfs;
 
-	/**
-	 * {@inheritDoc}
-	 */
-	public void stateChanged(Item item, State oldState, State newState) {
-		eventQueue.add(new StateEvent(item, oldState, newState));
-	}
+    private KieContainer container;
 
-	/**
-	 * {@inheritDoc}
-	 */
-	public void stateUpdated(Item item, State state) {
-		eventQueue.add(new StateEvent(item, state));
-	}
+    private KieSession session;
 
-	public void receiveCommand(String itemName, Command command) {
-		try {
-			Item item = itemRegistry.getItem(itemName);
-			eventQueue.add(new CommandEvent(item, command));
-		} catch (ItemNotFoundException e) {}
-	}
-	
-	private void internalItemAdded(Item item) {
-		if(item==null) {
-			logger.debug("Item must not be null here!");
-			return;
-		}
-		
-		FactHandle handle = factHandleMap.get(item.getName());
-		if(handle!=null) {
-			// we already know this item
-			try {
-				ksession.update(handle, item);
-			} catch(NullPointerException e) {
-				// this can be thrown because of a bug in drools when closing down the system
-			}
-		} else {
-			// it is a new item
-			handle = ksession.insert(item);
-			factHandleMap.put(item.getName(), handle);
-			if (item instanceof GenericItem) {
-				GenericItem genericItem = (GenericItem) item;
-				genericItem.addStateChangeListener(this);
-			}
-		}
-	}
+    private FileAlterationMonitor monitor;
+    private RuleService.RuleChangeListener ruleChangeListener = new RuleChangeListener();
+    private Map<String, Resource> changedRules = Collections.synchronizedMap(new HashMap<String, Resource>());
 
-	private void internalItemRemoved(String itemName) {
-		FactHandle handle = factHandleMap.get(itemName);
-		if(handle!=null) {
-			factHandleMap.remove(itemName);
-			ksession.retract(handle);
-		}		
-	}
-	
-	/**
-	 * @{inheritDoc}
-	 */
-	@Override
-	protected synchronized void execute() {
-		// remove all previous events from the session
-		Collection<FactHandle> handles = ksession.getFactHandles(new ObjectFilter() {			
-			public boolean accept(Object obj) {
-				if (obj instanceof RuleEvent) {
-					return true;
-				}
-				return false;
-			}
-		});
-		for(FactHandle handle : handles) {
-			ksession.retract(handle);
-		}
+    private ExecutionThread thread;
 
-		ArrayList<RuleEvent> clonedQueue = new ArrayList<RuleEvent>(eventQueue);
-		eventQueue.clear();
-		
-		// now add all recent events to the session
-		for(RuleEvent event : clonedQueue) {
-			Item item = event.getItem();
-			if(ksession!=null && item!=null) {
-				FactHandle factHandle = factHandleMap.get(item.getName());
-				if(factHandle!=null) {
-					ksession.update(factHandle, item);
-				}
-				ksession.insert(event);
-			}
-		}
-		
-		// run the rule evaluation
-		ksession.fireAllRules();
-			
-	}
+    public void activate() {
+        ks = KieServices.Factory.get();
+        kfs = ks.newKieFileSystem();
+        KieModuleModel moduleModel = ks.newKieModuleModel();
+        moduleModel.newKieBaseModel("openhab-rules")
+                .setEventProcessingMode(EventProcessingOption.STREAM)
+                .newKieSessionModel("openhab-session")
+                .setType(KieSessionModel.KieSessionType.STATEFUL)
+                .setConsoleLogger("org.openhab.core.drools");
+        kfs.writeKModuleXML(moduleModel.toXML());
 
-	@Override
-	protected long getRefreshInterval() {
-		return refreshInterval;
-	}
+        ReleaseId releaseId = loadRules(Collections.<String, Resource>singletonMap(
+                "core/default.drl", new ClassPathResource("/org/openhab/core/drools/default.drl")));
+        if (releaseId == null) {
+            throw new IllegalStateException("Initial rule loading failed");
+        }
+        container = ks.newKieContainer(releaseId);
+        for (File file : listAllFiles()) {
+            ruleChangeListener.onFileCreate(file);
+        }
 
-	@Override
-	protected String getName() {
-		return "Rule Evaluation Service";
-	}
+        session = container.newKieSession("openhab-session");
 
-	/**
-	 * {@inheritDoc}
-	 */
-	public void handleEvent(Event event) {  
-		String itemName = (String) event.getProperty("item");
-		
-		String topic = event.getTopic();
-		String[] topicParts = topic.split(TOPIC_SEPERATOR);
-		
-		if(!(topicParts.length > 2) || !topicParts[0].equals(TOPIC_PREFIX)) {
-			return; // we have received an event with an invalid topic
-		}
-		String operation = topicParts[1];
-		
-		if(operation.equals(EventType.COMMAND.toString())) {
-			Command command = (Command) event.getProperty("command");
-			if(command!=null) receiveCommand(itemName, command);
-		}
-	}
+        thread = new ExecutionThread();
+        addItems(itemRegistry.getItems());
+        addUpdate(new SystemStartup());
+        thread.start();
 
-	static private final class RuleEventListener implements SystemEventListener {
-		
-		private final Logger logger = LoggerFactory.getLogger(SystemEventListener.class);
-	
-		public void warning(String message, Object object) {
-			logger.warn(message);
-		}
-	
-		public void warning(String message) {
-			logger.warn(message);			
-		}
-	
-		public void info(String message, Object object) {
-			logger.info(message);
-		}
-	
-		public void info(String message) {
-			logger.info(message);
-		}
-	
-		public void exception(String message, Throwable e) {
-			logger.error(message, e);
-		}
-	
-		public void exception(Throwable e) {
-			logger.error(e.getLocalizedMessage(), e);
-		}
-	
-		public void debug(String message, Object object) {
-			logger.debug(message);
-		}
-	
-		public void debug(String message) {
-			logger.debug(message);
-		}
-	}
+        try {
+            FileAlterationObserver observer = new FileAlterationObserver(RULES_DIR,
+                    FileFilterUtils.or(RULES_FILTER, RULES_DIR_FILTER));
+            observer.addListener(ruleChangeListener);
+            monitor = new FileAlterationMonitor();
+            monitor.addObserver(observer);
+            monitor.start();
+        } catch (Exception e) {
+            throw Throwables.propagate(e);
+        }
 
+        logger.info("Dools service started");
+    }
+
+    private boolean active() {
+        ExecutionThread thread = this.thread;
+        return thread != null && !thread.shutdown;
+    }
+
+    private Collection<File> listAllFiles() {
+        if (!RULES_DIR.exists()) {
+            throw new IllegalStateException("Drools folder not found: " + RULES_DIR.getAbsolutePath());
+        }
+        return FileUtils.listFiles(RULES_DIR, RULES_FILTER, RULES_DIR_FILTER);
+    }
+
+    private String formatMessages(List<Message> messages) {
+        StringBuilder builder = new StringBuilder("Drools compilation messages:");
+        for (Message message : messages) {
+            builder.append('\n').append(message.toString());
+        }
+        return builder.toString();
+    }
+
+    private ReleaseId loadRules(Map<String, Resource> rules) {
+        ReleaseId releaseId = ks.newReleaseId("org.openhab", "drools", DateFormatUtils.ISO_DATETIME_FORMAT.format(new Date()));
+        kfs.generateAndWritePomXML(releaseId);
+        for (Map.Entry<String, Resource> rule : rules.entrySet()) {
+            String path = "src/main/resources/" + rule.getKey();
+            Resource resource = rule.getValue();
+            if (resource != null) {
+                kfs.write(path, resource);
+            } else {
+                kfs.delete(path);
+            }
+        }
+        try {
+            Results results = ks.newKieBuilder(kfs).buildAll().getResults();
+            if (results.hasMessages(Message.Level.ERROR)) {
+                releaseId = null;
+                logger.error(formatMessages(results.getMessages(Message.Level.ERROR)));
+            }
+            if (results.hasMessages(Message.Level.WARNING)) {
+                logger.warn(formatMessages(results.getMessages(Message.Level.WARNING)));
+            }
+            if (results.hasMessages(Message.Level.INFO)) {
+                logger.info(formatMessages(results.getMessages(Message.Level.INFO)));
+            }
+            if (releaseId != null) {
+                logger.info("Loaded Drools knowledge base " + releaseId.toString());
+            }
+            return releaseId;
+        } catch (Exception e) {
+            logger.error("Unexpected error during Drools compilation", e);
+            return null;
+        }
+    }
+
+    public void deactivate() {
+        if (monitor != null) {
+            try {
+                monitor.stop();
+            } catch (Exception e) {
+                logger.error("Cannot stop rule change monitor", e);
+            }
+            monitor = null;
+        }
+        changedRules.clear();
+
+        if (active()) {
+            addUpdate(new SystemShutdown());
+            try {
+                thread.join();
+            } catch (InterruptedException e) {
+                thread.interrupt();
+                logger.error("Drools thread shutdown interrupted", e);
+            }
+            thread = null;
+        }
+
+        if (session != null) {
+            try {
+                session.halt();
+                session.dispose();
+            } catch (Exception e) {
+                logger.error("Cannot stop rule change monitor", e);
+            }
+            session = null;
+        }
+        container = null;
+        kfs = null;
+        ks = null;
+
+        factHandles.clear();
+        updates.clear();
+
+        logger.info("Dools service stopped");
+    }
+
+    public void setItemRegistry(ItemRegistry itemRegistry) {
+        this.itemRegistry = itemRegistry;
+        itemRegistry.addItemRegistryChangeListener(this);
+    }
+
+    public void unsetItemRegistry(ItemRegistry itemRegistry) {
+        itemRegistry.removeItemRegistryChangeListener(this);
+        this.itemRegistry = null;
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void allItemsChanged(Collection<String> oldItemNames) {
+        addItems(itemRegistry.getItems());
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void itemAdded(Item item) {
+        addItems(Collections.singleton(item));
+    }
+
+    private void addItems(Collection<Item> items) {
+        if (active()) {
+            synchronized (updates) {
+                for (Item item : items) {
+                    replaceUpdate("item=" + item.getName(), item);
+                    if (item instanceof GenericItem) {
+                        ((GenericItem) item).addStateChangeListener(this);
+                    }
+                }
+            }
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void itemRemoved(Item item) {
+        if (active()) {
+            if (item instanceof GenericItem) {
+                ((GenericItem) item).removeStateChangeListener(this);
+            }
+            replaceUpdate("item=" + item.getName(), null);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void stateChanged(Item item, State oldState, State newState) {
+        if (active()) {
+            addUpdate("state=" + item.getName(), StateEvent.create(item, oldState, newState));
+            replaceUpdate("item=" + item.getName(), item);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void stateUpdated(Item item, State state) {
+        stateChanged(item, state, state);
+    }
+
+    public void receiveCommand(String itemName, Command command) {
+        try {
+            Item item = itemRegistry.getItem(itemName);
+            addUpdate("command=" + item.getName(), new CommandEvent(item, command));
+        } catch (ItemNotFoundException e) {
+            logger.error("Received command {} for unknown item {}", command, itemName);
+        }
+    }
+
+    /**
+     * {@inheritDoc}
+     */
+    public void handleEvent(Event event) {
+        String itemName = (String) event.getProperty("item");
+
+        String topic = event.getTopic();
+        String[] topicParts = topic.split(TOPIC_SEPERATOR);
+
+        if (!(topicParts.length > 2) || !topicParts[0].equals(TOPIC_PREFIX)) {
+            return; // we have received an event with an invalid topic
+        }
+        String operation = topicParts[1];
+
+        if (operation.equals(EventType.COMMAND.toString())) {
+            Command command = (Command) event.getProperty("command");
+            if (command != null) receiveCommand(itemName, command);
+        }
+    }
+
+    private void execute() {
+        List<Map.Entry<String, Object>> updates;
+        synchronized (this.updates) {
+            updates = new ArrayList<Map.Entry<String, Object>>(this.updates.entries());
+            this.updates.clear();
+        }
+
+        List<FactHandle> immediate = new LinkedList<FactHandle>();
+        for (Map.Entry<String, Object> update : updates) {
+            String key = update.getKey();
+            Object value = update.getValue();
+            FactHandle handle;
+            if (key == null) {
+                handle = session.insert(value);
+            } else {
+                handle = factHandles.get(key);
+                if (value == null) {
+                    if (handle != null) {
+                        session.delete(handle);
+                    }
+                } else {
+                    if (handle == null) {
+                        handle = session.insert(value);
+                        factHandles.put(key, handle);
+                    } else {
+                        session.update(handle, value);
+                    }
+                }
+                if (value == null || value instanceof ImmediateEvent) {
+                    factHandles.remove(key);
+                }
+            }
+
+            if (value instanceof ImmediateEvent) {
+                immediate.add(handle);
+            }
+            if (value instanceof SystemShutdown) {
+                thread.shutdown = true;
+            }
+        }
+
+        try {
+            session.fireAllRules();
+        } finally {
+            for (FactHandle handle : immediate) {
+                session.delete(handle);
+            }
+        }
+    }
+
+    private void addUpdate(Object value) {
+        addUpdate(null, value);
+    }
+
+    private void addUpdate(String key, Object value) {
+        synchronized (updates) {
+            updates.put(key, value);
+        }
+    }
+
+    private void replaceUpdate(String key, Object value) {
+        synchronized (updates) {
+            updates.replaceValues(key, Collections.singleton(value));
+        }
+    }
+
+    private class ExecutionThread extends Thread {
+        boolean shutdown = false;
+
+        @Override
+        public void run() {
+            while (!shutdown) {
+                if (!changedRules.isEmpty()) {
+                    try {
+                        HashMap<String, Resource> rules = new HashMap<String, Resource>(changedRules);
+                        ReleaseId releaseId = loadRules(rules);
+                        changedRules.keySet().removeAll(rules.keySet());
+                        if (releaseId != null) {
+                            container.updateToVersion(releaseId);
+                        }
+                    } catch (Exception e) {
+                        logger.error("Unexpected error during Drools reload", e);
+                    }
+                }
+                try {
+                    synchronized (updates) {
+                        if (updates.isEmpty()) {
+                            updates.wait(1000l);
+                        }
+                    }
+                    execute();
+                } catch (InterruptedException e) {
+                    logger.error("Drools thread interrupted", e);
+                    return;
+                }
+            }
+        }
+    }
+
+    private class RuleChangeListener extends FileAlterationListenerAdaptor {
+        @Override
+        public void onFileCreate(File file) {
+            onFileChange(file);
+        }
+
+        @Override
+        public void onFileDelete(File file) {
+            onFileChange(file);
+        }
+
+        @Override
+        public void onFileChange(File file) {
+            String name = RULES_DIR.toURI().relativize(file.toURI()).getPath();
+            if (file.exists() && file.isFile()) {
+                changedRules.put(name, new FileSystemResource(file));
+            } else {
+                changedRules.put(name, null);
+            }
+        }
+    }
 }

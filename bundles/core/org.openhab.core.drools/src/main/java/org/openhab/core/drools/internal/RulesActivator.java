@@ -19,25 +19,25 @@ import org.osgi.util.tracker.ServiceTracker;
  */
 public final class RulesActivator implements BundleActivator {
 
-	public static ServiceTracker<ItemRegistry, ItemRegistry> itemRegistryTracker;
-	public static ServiceTracker<EventPublisher, EventPublisher> eventPublisherTracker;
-	
-	/**
-	 * Called whenever the OSGi framework starts our bundle
-	 */
-	public void start(BundleContext bc) throws Exception {
-		itemRegistryTracker = new ServiceTracker<ItemRegistry, ItemRegistry>(bc, ItemRegistry.class, null);
-		itemRegistryTracker.open();
+    public static ServiceTracker<ItemRegistry, ItemRegistry> itemRegistryTracker;
+    public static ServiceTracker<EventPublisher, EventPublisher> eventPublisherTracker;
 
-		eventPublisherTracker = new ServiceTracker<EventPublisher, EventPublisher>(bc, EventPublisher.class, null);
-		eventPublisherTracker.open();
-}
+    /**
+     * Called whenever the OSGi framework starts our bundle
+     */
+    public void start(BundleContext bc) throws Exception {
+        itemRegistryTracker = new ServiceTracker<ItemRegistry, ItemRegistry>(bc, ItemRegistry.class, null);
+        itemRegistryTracker.open();
 
-	/**
-	 * Called whenever the OSGi framework stops our bundle
-	 */
-	public void stop(BundleContext bc) throws Exception {
-		itemRegistryTracker.close();
-		eventPublisherTracker.close();
-	}
+        eventPublisherTracker = new ServiceTracker<EventPublisher, EventPublisher>(bc, EventPublisher.class, null);
+        eventPublisherTracker.open();
+    }
+
+    /**
+     * Called whenever the OSGi framework stops our bundle
+     */
+    public void stop(BundleContext bc) throws Exception {
+        itemRegistryTracker.close();
+        eventPublisherTracker.close();
+    }
 }
